@@ -581,6 +581,9 @@ pub fn with_links(s: &Session, clips: &[ClipId]) -> Vec<ClipId> {
     let mut out = clips.to_vec();
     if s.state.linked_selection {
         let links: Vec<u64> = clips.iter().filter_map(|c| seq.find_item(*c).and_then(|(_, i)| i.link)).collect();
+        if links.is_empty() {
+            return out;
+        }
         for t in seq.all_tracks() {
             for i in &t.items {
                 if i.link.is_some_and(|l| links.contains(&l)) && !out.contains(&i.id) {

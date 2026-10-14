@@ -25,7 +25,8 @@ use crate::theme::Tokens;
 use super::timeline_hit::{EdgeKind, Grab, edge_geometry, grab_at, marker_at, marker_range_rect, marker_rect, marker_under_pointer};
 pub use super::timeline_hit::{Hit, ROLL_PX, hit, selection_trim_kind};
 
-const TOP_H: f32 = 58.0; // timecode + toolbar (left) / ruler (right)
+const BASE_TOP_H: f32 = 58.0;
+const TOP_H: f32 = BASE_TOP_H + 10.0; // timecode + toolbar (left) / compact edit strip + ruler (right)
 const RULER_H: f32 = 44.0;
 const SCROLLBAR_H: f32 = 17.0;
 const DIVIDER_H: f32 = 5.0;
@@ -447,7 +448,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let caption_area = Rect::from_min_max(pos2(rect.min.x, content.min.y), pos2(content.max.x, content.min.y + cap_n as f32 * super::timeline_captions::ROW_H));
     let cap_h = if cap_n > 0 { caption_area.height() + DIVIDER_H } else { 0.0 };
     let tracks_area = Rect::from_min_max(pos2(content.min.x, content.min.y + cap_h), content.max);
-    let split_y = tracks_area.min.y + (tracks_area.height() - DIVIDER_H) * app.ui.timeline.split;
+    // Keep the divider at its old screen position when the compact edit strip extends the top
+    // block. The extra ten points come from the video half, preserving room below audio tracks
+    // for dragging a clip onto a new track.
+    let split_y = tracks_area.min.y + (tracks_area.height() - DIVIDER_H) * app.ui.timeline.split - (TOP_H - BASE_TOP_H) * (1.0 - app.ui.timeline.split);
     let video_area = Rect::from_min_max(pos2(rect.min.x, tracks_area.min.y), pos2(content.max.x, split_y));
     let audio_area = Rect::from_min_max(pos2(rect.min.x, split_y + DIVIDER_H), pos2(content.max.x, tracks_area.max.y - MASTER_H));
     let vh = app.ui.timeline.video_track_h;
@@ -1457,6 +1461,83 @@ pub fn ruler_steps(frame_px: f64, base: i64) -> (i64, i64) {
     (minor, label_step)
 }
 
+/// Whether the edit strip can actually change the current sequence. The command registry checks
+/// that a sequence is open; the strip also checks for an editable clip at the playhead so a
+/// button never appears live when that command would make no edit.
+fn edit_toolbar_enabled(app: &FilmcraftApp, seq: &Sequence) -> [bool; 5] {
+    let ph = app.session.playhead();
+    let selected = &app.session.state.selection;
+    let linked = if selected.is_empty() { Vec::new() } else { filmcraft_engine::commands::with_links(&app.session, selected) };
+    let targeted = app.session.targeting().targeted;
+    let mut selected_at = false;
+    let mut selected_cuttable = false;
+    let mut targeted_cuttable = false;
+    let mut selected_trimmable = false;
+    let mut targeted_trimmable = false;
+    let mut deletable = false;
+    for tr in seq.all_tracks() {
+        if let Some(it) = tr.item_at(ph).filter(|it| it.start < ph && ph < it.end()) {
+            let chosen = selected.contains(&it.id);
+            selected_at |= chosen;
+            if !tr.locked {
+                selected_cuttable |= chosen;
+                targeted_cuttable |= targeted.is_empty() || targeted.contains(&tr.id);
+                selected_trimmable |= linked.contains(&it.id);
+                targeted_trimmable |= targeted.contains(&tr.id);
+            }
+        }
+        if !deletable && !tr.locked && !linked.is_empty() {
+            deletable |= tr.items.iter().any(|it| linked.contains(&it.id));
+        }
+    }
+    let split = app.session.is_enabled("sequence.addEdit") && if selected_at { selected_cuttable } else { targeted_cuttable };
+    let trim = selected_trimmable || targeted_trimmable;
+    [
+        split,
+        trim && app.session.is_enabled("trim.ripplePrevious"),
+        trim && app.session.is_enabled("trim.rippleNext"),
+        deletable && app.session.is_enabled("edit.clear"),
+        app.session.is_enabled("markers.add"),
+    ]
+}
+
+fn draw_edit_toolbar(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq: &Sequence, layout: &Layout, t: &Tokens) {
+    let actions = [
+        ("split", Icon::Razor, tl!("Split"), tl!("Split clips at the playhead"), "sequence.addEdit"),
+        ("deleteLeft", Icon::StepBack, tl!("Delete Left"), tl!("Ripple trim the left side to the playhead"), "trim.ripplePrevious"),
+        ("deleteRight", Icon::StepFwd, tl!("Delete Right"), tl!("Ripple trim the right side to the playhead"), "trim.rippleNext"),
+        ("deleteSelected", Icon::Trash, tl!("Delete Selected"), tl!("Delete selected timeline clips"), "edit.clear"),
+        ("addMarker", Icon::Marker, tl!("Add Marker"), tl!("Add a marker at the playhead"), "markers.add"),
+    ];
+    let enabled = edit_toolbar_enabled(app, seq);
+    let p = ui.painter().clone();
+    let font = Tokens::ui(11.0);
+    let widths = actions.map(|(_, _, label, _, _)| p.layout_no_wrap(label.to_string(), font.clone(), t.text).size().x + 33.0);
+    let available = (layout.content.max.x - layout.content.min.x - 12.0).max(0.0);
+    let compact = widths.iter().sum::<f32>() + 16.0 > available;
+    let mut x = layout.content.min.x + 6.0;
+    for (index, (key, icon, label, tip, command)) in actions.into_iter().enumerate() {
+        let width = if compact { 26.0 } else { widths[index] };
+        let button = Rect::from_min_size(pos2(x, rect.min.y + 3.0), vec2(width, 18.0));
+        let response =
+            ui.add_enabled_ui(enabled[index], |ui| ui.interact(button, egui::Id::new(("tl-edit-toolbar", key)), Sense::click())).inner.on_hover_text(tip);
+        p.rect_filled(button, 3.0, if response.hovered() && enabled[index] { t.hover } else { t.tl_header_bg });
+        p.rect_stroke(button, 3.0, Stroke::new(1.0, t.separator), StrokeKind::Inside);
+        let color = if enabled[index] { t.text } else { t.text_faint };
+        icons::paint(&p, Rect::from_min_size(button.min + vec2(5.0, 2.0), vec2(14.0, 14.0)), icon, color);
+        if !compact {
+            p.text(pos2(button.min.x + 26.0, button.center().y), Align2::LEFT_CENTER, label, font.clone(), color);
+        }
+        app.auto.add_response(&format!("timeline.editToolbar.{key}"), &response, tip);
+        if response.clicked()
+            && let Err(e) = app.session.execute(command, json!({}))
+        {
+            app.ui.status = e.to_string();
+        }
+        x += width + 4.0;
+    }
+}
+
 fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq: &Sequence, layout: &Layout, t: &Tokens, seq_id: ItemId) {
     let p = ui.painter().clone();
     let rate = seq.settings.frame_rate;
@@ -1464,6 +1545,7 @@ fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq: &Sequenc
     let ruler = layout.ruler;
     // background of the whole top block
     p.rect_filled(Rect::from_min_max(rect.min, pos2(rect.max.x, ruler.max.y)), 0.0, t.panel_bg);
+    draw_edit_toolbar(app, ui, rect, seq, layout, t);
     // current timecode: Premiere's big blue timecode
     let tc = format_time(app.session.playhead(), rate, seq.settings.drop_frame, TimeDisplay::Timecode, seq.settings.sample_rate as i64);
     let tc_rect = Rect::from_min_size(pos2(rect.min.x + 14.0, rect.min.y + 4.0), vec2(hw - 20.0, 20.0));
