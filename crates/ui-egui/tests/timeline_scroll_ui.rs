@@ -265,6 +265,28 @@ fn the_scroll_bar_thumb_follows_the_pointer_and_reaches_both_ends() {
 }
 
 #[test]
+fn the_scroll_bar_paints_the_first_drag_movement_in_the_same_frame() {
+    let mut d = Driver::tall();
+    let thumb = d.rect("timeline.zoomBar");
+    let from = egui::pos2(thumb[0] + thumb[2] / 2.0, thumb[1] + thumb[3] / 2.0);
+    d.harness.input_mut().events.push(egui::Event::PointerMoved(from));
+    d.frames(1);
+    d.harness.input_mut().events.push(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    d.frames(1);
+    d.harness.input_mut().events.push(egui::Event::PointerMoved(from + egui::vec2(3.0, 0.0)));
+    d.frames(1);
+    let scroll = d.app().ui.timeline.scroll;
+    assert!(scroll > 4.0, "the thumb moves before egui's drag threshold");
+    let painted_scroll = d.app().tl.layout.as_ref().unwrap().scroll;
+    assert!((painted_scroll - scroll).abs() < 1e-6, "the timeline must paint the moved position in the same frame");
+}
+
+#[test]
 fn the_scroll_bar_moves_before_eguis_drag_threshold() {
     let mut d = Driver::tall();
     d.ok("ui.set", json!({"timeline": {"scroll": 0.0}}));

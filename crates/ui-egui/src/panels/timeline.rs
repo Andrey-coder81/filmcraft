@@ -319,13 +319,40 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let content = Rect::from_min_max(pos2(rect.min.x + header_w, rect.min.y + TOP_H), pos2(rect.max.x - SCROLLBAR_H, rect.max.y - SCROLLBAR_H));
     let ruler = Rect::from_min_max(pos2(content.min.x, rect.min.y + TOP_H - RULER_H), pos2(content.max.x, rect.min.y + TOP_H));
     app.last_timeline_width = content.width();
+    let duration = seq.duration();
+    let seq_seconds = duration.seconds();
+
+    // Apply an ongoing horizontal drag before computing layout and painting. Handling it only in
+    // the widgets below left the drawn timeline one pointer frame behind the cursor.
+    if !app.tl.cancelled
+        && let Some(p) = ctx.input(|i| i.pointer.interact_pos())
+    {
+        match app.tl.drag {
+            Some(Drag::Pan { last, start_scroll, start_v }) if ctx.input(|i| i.pointer.any_down()) => {
+                let v = &mut app.ui.timeline;
+                v.target_scroll = (v.target_scroll - (p.x - last.x) as f64 / v.pps).max(0.0);
+                v.scroll = v.target_scroll;
+                v.v_scroll += p.y - last.y;
+                app.tl.drag = Some(Drag::Pan { last: p, start_scroll, start_v });
+            }
+            Some(Drag::ZoomBar { grab, start, mode: 0, .. }) if ctx.input(|i| i.pointer.primary_down()) => {
+                let bar = Rect::from_min_max(pos2(content.min.x, rect.max.y - SCROLLBAR_H + 2.0), pos2(content.max.x, rect.max.y - 2.0));
+                let v = &mut app.ui.timeline;
+                let (_, _, per_point) = zoom_thumb(bar, seq_seconds, v.scroll, v.pps);
+                let range = (timeline_extent(seq_seconds) - bar.width() as f64 / v.pps).max(0.0);
+                v.target_scroll = (start + (p.x - grab) as f64 * per_point).clamp(0.0, range);
+                v.scroll = v.target_scroll;
+            }
+            _ => {}
+        }
+    }
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, t.panel_bg);
 
     // ---- sequence tabs strip (top-left header block)
     // ---- animated zoom / scroll
-    let empty = seq.duration().seconds() <= 0.0;
-    let dur_s = seq.duration().seconds().max(1.0);
+    let empty = seq_seconds <= 0.0;
+    let dur_s = seq_seconds.max(1.0);
     {
         let v = &mut app.ui.timeline;
         if let Some(p) = v.fit_empty
@@ -404,7 +431,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // a script): scrolled past it, nothing is in view and the scroll bar has nowhere to show it.
     {
         let v = &mut app.ui.timeline;
-        let seconds = seq.duration().seconds();
+        let seconds = seq_seconds;
         if !v.scroll.is_finite() || !v.target_scroll.is_finite() {
             (v.scroll, v.target_scroll) = (0.0, 0.0);
         }
@@ -464,7 +491,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // in/out shading across tracks
     if seq.mark_in.is_some() || seq.mark_out.is_some() {
         let a = layout.x_of(seq.mark_in.unwrap_or(Tick::ZERO)).max(content.min.x);
-        let b = layout.x_of(seq.mark_out.map(|o| o + rate.frame_duration()).unwrap_or(seq.duration())).min(content.max.x);
+        let b = layout.x_of(seq.mark_out.map(|o| o + rate.frame_duration()).unwrap_or(duration)).min(content.max.x);
         if b > a {
             painter.rect_filled(Rect::from_min_max(pos2(a, content.min.y), pos2(b, content.max.y)), 0.0, t.in_out_shade);
         }
@@ -689,13 +716,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 
     // ---- scroll bars
-    zoom_scrollbar(
-        app,
-        ui,
-        Rect::from_min_max(pos2(content.min.x, rect.max.y - SCROLLBAR_H + 2.0), pos2(content.max.x, rect.max.y - 2.0)),
-        seq.duration().seconds(),
-        &t,
-    );
+    zoom_scrollbar(app, ui, Rect::from_min_max(pos2(content.min.x, rect.max.y - SCROLLBAR_H + 2.0), pos2(content.max.x, rect.max.y - 2.0)), seq_seconds, &t);
     vertical_scrollbar(
         ui,
         Rect::from_min_max(pos2(content.max.x, video_area.min.y), pos2(rect.max.x, video_area.max.y)),

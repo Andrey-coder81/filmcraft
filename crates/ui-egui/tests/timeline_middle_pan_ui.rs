@@ -141,6 +141,8 @@ fn a_middle_pan_moves_before_eguis_drag_threshold() {
     d.send(egui::Event::PointerMoved(from - egui::vec2(3.0, 0.0))); // below egui's usual 6-point threshold
     let scroll = d.app().ui.timeline.target_scroll;
     assert!((scroll - 4.06).abs() < 1e-6, "the first 3 points should pan immediately: {scroll}");
+    let painted_scroll = d.app().tl.layout.as_ref().unwrap().scroll;
+    assert!((painted_scroll - scroll).abs() < 1e-6, "the first movement must be painted in the same frame: {painted_scroll} vs {scroll}");
     d.middle(from - egui::vec2(3.0, 0.0), false);
     assert!(d.app().tl.drag.is_none(), "releasing a sub-threshold pan ends the gesture");
 }
