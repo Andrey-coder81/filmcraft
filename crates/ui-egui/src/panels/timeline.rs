@@ -10,6 +10,7 @@
 //! drawn as GPU meshes by egui's wgpu backend and culled to the visible range.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use egui::{Align2, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
@@ -63,6 +64,17 @@ pub struct TlState {
     zoom_anchor: Option<(f64, f32)>,
     /// The zoom (points a second) the video thumbnails are laid out at while the view is zooming (#1094).
     thumb_pps: Option<f64>,
+    /// Render-bar spans depend on edits and finished preview files, not on the viewport. Rebuilding
+    /// them for every pointer movement makes scrollbar drags scale with the whole sequence.
+    render_bar: Option<RenderBarCache>,
+}
+
+struct RenderBarCache {
+    project: Arc<filmcraft_project::Project>,
+    previews: Arc<filmcraft_engine::previews::PreviewStore>,
+    sequence: ItemId,
+    generation: u64,
+    spans: Vec<filmcraft_engine::previews::BarSpan>,
 }
 
 impl TlState {
@@ -75,6 +87,71 @@ impl TlState {
         self.seq_peak_keys = Default::default();
         self.seq_keys_seen.clear();
         self.peak_max.clear();
+        self.render_bar = None;
+    }
+
+    fn render_bar(
+        &mut self,
+        project: &Arc<filmcraft_project::Project>,
+        previews: &Arc<filmcraft_engine::previews::PreviewStore>,
+        seq_id: ItemId,
+    ) -> &[filmcraft_engine::previews::BarSpan] {
+        let generation = previews.generation.load(Ordering::Acquire);
+        if !self.render_bar.as_ref().is_some_and(|cache| {
+            Arc::ptr_eq(&cache.project, project) && Arc::ptr_eq(&cache.previews, previews) && cache.sequence == seq_id && cache.generation == generation
+        }) {
+            self.render_bar = Some(RenderBarCache {
+                project: project.clone(),
+                previews: previews.clone(),
+                sequence: seq_id,
+                generation,
+                spans: previews.bar(project, seq_id),
+            });
+        }
+        self.render_bar.as_ref().map_or(&[], |cache| cache.spans.as_slice())
+    }
+}
+
+#[cfg(test)]
+mod render_bar_cache_tests {
+    use super::*;
+    use filmcraft_engine::previews::{BarSpan, BarState};
+
+    #[test]
+    fn render_bar_only_paints_spans_touching_the_ruler() {
+        let spans: Vec<BarSpan> = (0..1000).map(|i| BarSpan { start: Tick(i * 10), end: Tick((i + 1) * 10), state: BarState::Red }).collect();
+        let (first, shown) = visible_render_spans(&spans, (Tick(5030), Tick(5060)));
+        assert_eq!(first, 502, "a span ending at the left edge remains visible");
+        assert_eq!(shown, &spans[502..507], "a span starting at the right edge remains visible");
+        assert_eq!(visible_render_spans(&spans, (Tick(10010), Tick(10020))).1.len(), 0);
+    }
+
+    #[test]
+    fn render_bar_is_reused_while_scrolling_and_invalidated_when_its_inputs_change() {
+        let mut session = filmcraft_engine::Session::default();
+        session.execute("file.openDemoProject", serde_json::json!({})).unwrap();
+        let seq_id = session.state.active_sequence.unwrap();
+        let mut tl = TlState::default();
+        let original = tl.render_bar(&session.project, &session.previews, seq_id).to_vec();
+        assert!(!original.is_empty());
+        let spans = tl.render_bar.as_ref().unwrap().spans.as_ptr();
+
+        assert_eq!(tl.render_bar(&session.project, &session.previews, seq_id), original);
+        assert_eq!(tl.render_bar.as_ref().unwrap().spans.as_ptr(), spans, "scrolling reuses the render bar");
+
+        let previous_generation = session.previews.generation.fetch_add(1, Ordering::Release);
+        assert_eq!(tl.render_bar(&session.project, &session.previews, seq_id), original);
+        assert_eq!(tl.render_bar.as_ref().unwrap().generation, previous_generation + 1, "new previews invalidate the bar");
+
+        let edited_project = Arc::new((*session.project).clone());
+        tl.render_bar(&edited_project, &session.previews, seq_id);
+        assert!(Arc::ptr_eq(&tl.render_bar.as_ref().unwrap().project, &edited_project), "an edit changes the project snapshot");
+
+        let another_store = Arc::new(filmcraft_engine::previews::PreviewStore::default());
+        tl.render_bar(&edited_project, &another_store, seq_id);
+        assert!(Arc::ptr_eq(&tl.render_bar.as_ref().unwrap().previews, &another_store), "opening a project changes the preview store");
+        tl.reset_media_caches();
+        assert!(tl.render_bar.is_none());
     }
 }
 
@@ -756,6 +833,13 @@ fn visible_track_items(items: &[TrackItem], visible: (Tick, Tick)) -> &[TrackIte
     let first = items.partition_point(|item| item.end() < visible.0);
     let count = items[first..].partition_point(|item| item.start <= visible.1);
     &items[first..first + count]
+}
+
+/// The render-bar spans that touch the ruler. `PreviewStore::bar` emits spans in time order.
+fn visible_render_spans(spans: &[filmcraft_engine::previews::BarSpan], visible: (Tick, Tick)) -> (usize, &[filmcraft_engine::previews::BarSpan]) {
+    let first = spans.partition_point(|span| span.end < visible.0);
+    let count = spans[first..].partition_point(|span| span.start <= visible.1);
+    (first, &spans[first..first + count])
 }
 
 fn empty_state(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -1674,8 +1758,11 @@ fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq: &Sequenc
     // Per segment (engine `previews`): green = rendered preview, yellow = should play in real time,
     // red = needs rendering, nothing = plays natively.
     let rb = Rect::from_min_max(pos2(ruler.min.x, ruler.max.y - 2.0), ruler.max);
-    let bar = app.session.previews.bar(&app.session.project, seq_id);
-    for (i, span) in bar.iter().enumerate() {
+    let bar = app.tl.render_bar(&app.session.project, &app.session.previews, seq_id);
+    let visible = (layout.tick_at(ruler.min.x), layout.tick_at(ruler.max.x));
+    let (first, shown) = visible_render_spans(bar, visible);
+    for (offset, span) in shown.iter().enumerate() {
+        let i = first + offset;
         use filmcraft_engine::previews::BarState;
         let (c, what) = match span.state {
             BarState::None => continue,
