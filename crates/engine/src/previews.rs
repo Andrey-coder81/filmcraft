@@ -448,7 +448,7 @@ impl PreviewStore {
     }
 
     fn bump(&self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Segments of `seq` in this project snapshot (memoized per snapshot).
